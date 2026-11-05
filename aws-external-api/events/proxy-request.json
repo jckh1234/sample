@@ -1,0 +1,29 @@
+{
+  "resource": "/{proxy+}",
+  "path": "/orders/42",
+  "httpMethod": "GET",
+  "headers": {
+    "Accept": "application/json"
+  },
+  "queryStringParameters": {
+    "status": "open"
+  },
+  "pathParameters": {
+    "proxy": "orders/42"
+  },
+  "requestContext": {
+    "path": "/prod/orders/42",
+    "stage": "prod",
+    "httpMethod": "GET",
+    "resourcePath": "/{proxy+}",
+    "authorizer": {
+      "principalId": "00u1example",
+      "sub": "00u1example",
+      "email": "user@example.com",
+      "scp": "openid items.read",
+      "scope": "openid items.read"
+    }
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

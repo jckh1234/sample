@@ -11,3 +11,7 @@ The returned date is the last date whose file was saved. If a date in the range 
 - [C#](csharp/README.md) — .NET Framework 4.8, C# 7.3
 - [Java](java/README.md) — Java 8
 - [JavaScript](javascript/README.md) — Node.js
+
+## External API sample
+
+[aws-external-api](aws-external-api/README.md) is a separate AWS sample: API Gateway, an Okta REQUEST authorizer Lambda, a proxy Lambda, and HashiCorp Vault for the Okta client secret. It is not part of the state-file processors above. Explanations in that README are in Traditional Chinese.

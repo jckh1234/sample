@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  External API sample. API Gateway REST API, Okta REQUEST authorizer Lambda,
+  and a proxy Lambda in front of an internal service. Okta client_secret is
+  read from HashiCorp Vault at runtime. This template contains parameters
+  only — no real secrets.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[A-Za-z0-9]+$"
+    Description: API Gateway stage name.
+
+  OktaIssuer:
+    Type: String
+    AllowedPattern: "^https://.+"
+    Description: >
+      Okta authorization server issuer, without a trailing slash.
+      Example: https://your-domain.okta.com/oauth2/default
+      The authorizer calls {OktaIssuer}/v1/introspect.
+
+  OktaClientId:
+    Type: String
+    MinLength: 1
+    Description: Okta API client id used as the introspect Basic-auth username. Not a secret by itself.
+
+  OktaAudience:
+    Type: String
+    Default: ""
+    Description: >
+      Optional access-token audience. Leave empty to skip the aud check.
+      When set, the introspect aud claim (string or array) must contain this value.
+
+  VaultAddr:
+    Type: String
+    AllowedPattern: "^https://.+"
+    Description: >
+      Vault address, for example https://vault.example.com:8200.
+      No trailing path. The authorizer calls {VaultAddr}/v1/auth/approle/login
+      and GET {VaultAddr}/v1/{VaultOktaSecretPath}.
+
+  VaultRoleId:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: Vault AppRole role_id. Parameter value is not a secret committed to the template.
+
+  VaultSecretId:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: Vault AppRole secret_id. Do not commit a real value. NoEcho hides it in CloudFormation logs.
+
+  VaultOktaSecretPath:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_./-]+$"
+    Description: >
+      KV v2 API path relative to /v1/, including the data segment.
+      Example: secret/data/external-api/okta
+
+  VaultOktaSecretKey:
+    Type: String
+    Default: client_secret
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Key inside the KV v2 secret data object. Default client_secret.
+
+  VaultNamespace:
+    Type: String
+    Default: ""
+    Description: Optional Vault Enterprise namespace sent as X-Vault-Namespace. Leave empty for Vault OSS.
+
+  VaultSecretCacheSeconds:
+    Type: String
+    Default: "300"
+    AllowedPattern: "^[0-9]+$"
+    Description: In-memory TTL for the Okta client secret inside one Lambda execution environment. 0 disables the cache.
+
+  UpstreamBaseUrl:
+    Type: String
+    AllowedPattern: "^https?://.+"
+    Description: >
+      Internal service base URL the proxy Lambda calls.
+      Example: https://internal.example.net/api
+      No userinfo, query, or fragment.
+
+  ProxySubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional. Private subnet ids for the proxy Lambda. Leave empty to run the proxy outside a VPC.
+      Example: subnet-aaa,subnet-bbb
+
+  ProxySecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >
+      Optional. Security groups for the proxy Lambda when ProxySubnetIds is set.
+      Example: sg-0123456789abcdef0
+
+Conditions:
+  DeployProxyInVpc: !Not
+    - !Equals
+      - !Join ["", !Ref ProxySubnetIds]
+      - ""
+
+Rules:
+  ProxyVpcPaired:
+    Assertions:
+      - Assert: !Equals
+          - !Equals [!Join ["", !Ref ProxySubnetIds], ""]
+          - !Equals [!Join ["", !Ref ProxySecurityGroupIds], ""]
+        AssertDescription: Set ProxySubnetIds and ProxySecurityGroupIds together, or leave both empty.
+
+Resources:
+  ExternalApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-external-api
+      StageName: !Ref StageName
+      EndpointConfiguration: REGIONAL
+      Auth:
+        DefaultAuthorizer: OktaAuthorizer
+        Authorizers:
+          OktaAuthorizer:
+            FunctionArn: !GetAtt OktaAuthorizerFunction.Arn
+            FunctionPayloadType: REQUEST
+            Identity:
+              Headers:
+                - Authorization
+              # API Gateway caches the authorizer IAM policy and context for this
+              # many seconds, keyed by the Authorization header. The Allow policy
+              # therefore covers the whole stage (see the authorizer code).
+              ReauthorizeEvery: 300
+
+  OktaAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-okta-authorizer
+      Runtime: java17
+      MemorySize: 512
+      Timeout: 20
+      Handler: com.example.externalapi.authorizer.OktaAuthorizerHandler::handleRequest
+      CodeUri: authorizer/
+      Description: Okta introspect REQUEST authorizer. Reads the Okta client secret from Vault.
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          OKTA_ISSUER: !Ref OktaIssuer
+          OKTA_CLIENT_ID: !Ref OktaClientId
+          OKTA_AUDIENCE: !Ref OktaAudience
+          VAULT_ADDR: !Ref VaultAddr
+          VAULT_ROLE_ID: !Ref VaultRoleId
+          VAULT_SECRET_ID: !Ref VaultSecretId
+          VAULT_OKTA_SECRET_PATH: !Ref VaultOktaSecretPath
+          VAULT_OKTA_SECRET_KEY: !Ref VaultOktaSecretKey
+          VAULT_NAMESPACE: !Ref VaultNamespace
+          VAULT_SECRET_CACHE_SECONDS: !Ref VaultSecretCacheSeconds
+    Metadata:
+      BuildMethod: maven
+
+  # Resource-based policy: only this API's authorizer may invoke the function.
+  # SAM also adds an equivalent statement when it transforms Auth.Authorizers.
+  OktaAuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OktaAuthorizerFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExternalApi}/authorizers/*
+
+  ProxyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-proxy
+      Runtime: java17
+      MemorySize: 512
+      Timeout: 29
+      Handler: com.example.externalapi.proxy.ProxyHandler::handleRequest
+      CodeUri: proxy/
+      Description: Forwards authorized API Gateway requests to the internal service.
+      Policies: !If
+        - DeployProxyInVpc
+        - - AWSLambdaVPCAccessExecutionRole
+        - - AWSLambdaBasicExecutionRole
+      Environment:
+        Variables:
+          UPSTREAM_BASE_URL: !Ref UpstreamBaseUrl
+      # Attach the proxy to a VPC only when the internal service is private.
+      # Leave ProxySubnetIds empty and this property is omitted.
+      # Static form:
+      # VpcConfig:
+      #   SubnetIds:
+      #     - subnet-0123456789abcdef0
+      #     - subnet-fedcba9876543210
+      #   SecurityGroupIds:
+      #     - sg-0123456789abcdef0
+      VpcConfig: !If
+        - DeployProxyInVpc
+        - SubnetIds: !Ref ProxySubnetIds
+          SecurityGroupIds: !Ref ProxySecurityGroupIds
+        - !Ref AWS::NoValue
+      Events:
+        ProxyAny:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ExternalApi
+            Path: /{proxy+}
+            Method: ANY
+            Auth:
+              Authorizer: OktaAuthorizer
+    Metadata:
+      BuildMethod: maven
+
+  # Resource-based policy: only methods on this API stage may invoke the proxy.
+  # SAM also adds a statement for the ProxyAny event. Neither statement uses Principal "*".
+  ProxyInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ProxyFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ExternalApi}/${StageName}/*/*
+
+Outputs:
+  ExternalApiUrl:
+    Description: Invoke URL for the stage. Call a path under it; the root path itself has no method.
+    Value: !Sub https://${ExternalApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/
+
+  OktaAuthorizerFunctionArn:
+    Description: Okta authorizer Lambda ARN.
+    Value: !GetAtt OktaAuthorizerFunction.Arn
+
+  ProxyFunctionArn:
+    Description: Proxy Lambda ARN.
+    Value: !GetAtt ProxyFunction.Arn
