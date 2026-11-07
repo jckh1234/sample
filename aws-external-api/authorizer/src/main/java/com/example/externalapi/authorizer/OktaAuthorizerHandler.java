@@ -29,7 +29,11 @@ public final class OktaAuthorizerHandler
     }
 
     OktaAuthorizerHandler(AuthorizerConfig config, HttpClient http, Clock clock) {
-        this.introspector = new OktaTokenIntrospector(config, http, new VaultKvSecretCache(config, http, clock));
+        this(config, http, clock, AwsSdkV2IamSigner.fromDefaultCredentials());
+    }
+
+    OktaAuthorizerHandler(AuthorizerConfig config, HttpClient http, Clock clock, StsGetCallerIdentitySigner signer) {
+        this.introspector = new OktaTokenIntrospector(config, http, new VaultKvSecretCache(config, http, clock, signer));
         this.expectedIssuer = config.oktaIssuer();
         this.expectedAudience = config.oktaAudience();
     }

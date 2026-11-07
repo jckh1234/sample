@@ -54,20 +54,23 @@ Parameters:
     AllowedPattern: "^https://.+"
     Description: >
       Vault address, for example https://vault.example.com:8200.
-      No trailing path. The authorizer calls {VaultAddr}/v1/auth/approle/login
-      and GET {VaultAddr}/v1/{VaultOktaSecretPath}.
+      No trailing path. The authorizer signs sts:GetCallerIdentity and posts it to
+      {VaultAddr}/v1/auth/{VaultAuthMount}/login, then GET {VaultAddr}/v1/{VaultOktaSecretPath}.
 
-  VaultRoleId:
+  VaultAwsAuthRole:
     Type: String
-    NoEcho: true
     MinLength: 1
-    Description: Vault AppRole role_id. Parameter value is not a secret committed to the template.
+    AllowedPattern: "^[A-Za-z0-9_./-]+$"
+    Description: >
+      Vault AWS auth role name, not an IAM role ARN.
+      Example: external-api-authorizer.
+      Bind the authorizer Lambda execution role on this Vault role.
 
-  VaultSecretId:
+  VaultAuthMount:
     Type: String
-    NoEcho: true
-    MinLength: 1
-    Description: Vault AppRole secret_id. Do not commit a real value. NoEcho hides it in CloudFormation logs.
+    Default: aws
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Vault auth mount path segment. Login is /v1/auth/{VaultAuthMount}/login. Default aws.
 
   VaultOktaSecretPath:
     Type: String
@@ -151,7 +154,11 @@ Resources:
       Timeout: 20
       Handler: com.example.externalapi.authorizer.OktaAuthorizerHandler::handleRequest
       CodeUri: authorizer/
-      Description: Okta introspect REQUEST authorizer. Reads the Okta client secret from Vault.
+      Description: Okta introspect REQUEST authorizer. Reads the Okta client secret from Vault with AWS IAM auth.
+      # Credentials that sign GetCallerIdentity are this function's execution role.
+      # The function does not call STS; Vault replays the signed request.
+      # No sts:GetCallerIdentity permission is required. Bind OktaAuthorizerFunctionRole
+      # on the Vault AWS auth role named by VaultAwsAuthRole.
       Policies:
         - AWSLambdaBasicExecutionRole
       Environment:
@@ -160,8 +167,8 @@ Resources:
           OKTA_CLIENT_ID: !Ref OktaClientId
           OKTA_AUDIENCE: !Ref OktaAudience
           VAULT_ADDR: !Ref VaultAddr
-          VAULT_ROLE_ID: !Ref VaultRoleId
-          VAULT_SECRET_ID: !Ref VaultSecretId
+          VAULT_AWS_AUTH_ROLE: !Ref VaultAwsAuthRole
+          VAULT_AUTH_MOUNT: !Ref VaultAuthMount
           VAULT_OKTA_SECRET_PATH: !Ref VaultOktaSecretPath
           VAULT_OKTA_SECRET_KEY: !Ref VaultOktaSecretKey
           VAULT_NAMESPACE: !Ref VaultNamespace
@@ -231,6 +238,10 @@ Outputs:
   OktaAuthorizerFunctionArn:
     Description: Okta authorizer Lambda ARN.
     Value: !GetAtt OktaAuthorizerFunction.Arn
+
+  OktaAuthorizerExecutionRoleArn:
+    Description: Bind this IAM role ARN to the Vault AWS auth role (bound_iam_principal_arn).
+    Value: !GetAtt OktaAuthorizerFunctionRole.Arn
 
   ProxyFunctionArn:
     Description: Proxy Lambda ARN.

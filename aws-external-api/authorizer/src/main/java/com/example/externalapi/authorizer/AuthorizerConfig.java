@@ -8,14 +8,15 @@ import java.util.Map;
  */
 final class AuthorizerConfig {
     static final String DEFAULT_SECRET_KEY = "client_secret";
+    static final String DEFAULT_AUTH_MOUNT = "aws";
     static final int DEFAULT_CACHE_SECONDS = 300;
 
     private final String oktaIssuer;
     private final String oktaClientId;
     private final String oktaAudience;
     private final String vaultAddr;
-    private final String vaultRoleId;
-    private final String vaultSecretId;
+    private final String vaultAwsAuthRole;
+    private final String vaultAuthMount;
     private final String vaultSecretPath;
     private final String vaultSecretKey;
     private final String vaultNamespace;
@@ -26,8 +27,8 @@ final class AuthorizerConfig {
             String oktaClientId,
             String oktaAudience,
             String vaultAddr,
-            String vaultRoleId,
-            String vaultSecretId,
+            String vaultAwsAuthRole,
+            String vaultAuthMount,
             String vaultSecretPath,
             String vaultSecretKey,
             String vaultNamespace,
@@ -36,8 +37,8 @@ final class AuthorizerConfig {
         this.oktaClientId = oktaClientId;
         this.oktaAudience = oktaAudience;
         this.vaultAddr = vaultAddr;
-        this.vaultRoleId = vaultRoleId;
-        this.vaultSecretId = vaultSecretId;
+        this.vaultAwsAuthRole = vaultAwsAuthRole;
+        this.vaultAuthMount = vaultAuthMount;
         this.vaultSecretPath = vaultSecretPath;
         this.vaultSecretKey = vaultSecretKey;
         this.vaultNamespace = vaultNamespace;
@@ -50,13 +51,14 @@ final class AuthorizerConfig {
 
     static AuthorizerConfig from(Map<String, String> env) {
         String secretKey = optional(env, "VAULT_OKTA_SECRET_KEY");
+        String mount = optional(env, "VAULT_AUTH_MOUNT");
         return new AuthorizerConfig(
                 required(env, "OKTA_ISSUER"),
                 required(env, "OKTA_CLIENT_ID"),
                 optional(env, "OKTA_AUDIENCE"),
                 stripTrailingSlash(required(env, "VAULT_ADDR")),
-                required(env, "VAULT_ROLE_ID"),
-                required(env, "VAULT_SECRET_ID"),
+                required(env, "VAULT_AWS_AUTH_ROLE"),
+                authMount(mount),
                 stripLeadingSlash(required(env, "VAULT_OKTA_SECRET_PATH")),
                 secretKey == null ? DEFAULT_SECRET_KEY : secretKey,
                 optional(env, "VAULT_NAMESPACE"),
@@ -80,12 +82,14 @@ final class AuthorizerConfig {
         return vaultAddr;
     }
 
-    String vaultRoleId() {
-        return vaultRoleId;
+    /** Vault AWS auth role name. This is not an IAM role ARN. */
+    String vaultAwsAuthRole() {
+        return vaultAwsAuthRole;
     }
 
-    String vaultSecretId() {
-        return vaultSecretId;
+    /** Auth mount path segment. Default {@code aws}, so login is {@code /v1/auth/aws/login}. */
+    String vaultAuthMount() {
+        return vaultAuthMount;
     }
 
     String vaultSecretPath() {
@@ -107,6 +111,14 @@ final class AuthorizerConfig {
 
     String introspectUrl() {
         return AuthorizerSupport.normalizeIssuer(oktaIssuer) + "/v1/introspect";
+    }
+
+    private static String authMount(String mount) {
+        String value = mount == null ? DEFAULT_AUTH_MOUNT : mount;
+        if (!value.matches("[A-Za-z0-9_-]+")) {
+            throw new IllegalStateException("VAULT_AUTH_MOUNT must be a single path segment");
+        }
+        return value;
     }
 
     private static String required(Map<String, String> env, String key) {
