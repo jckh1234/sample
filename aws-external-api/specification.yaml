@@ -1,0 +1,121 @@
+# OpenAPI body imported by API Gateway.
+# CI replaces AWS_REGION, AWS_ACCOUNT_ID, ROUTER_FUNCTION_NAME, and LAMBDA_AUTHORIZER_NAME
+# tokens (written as double angle brackets in the URIs below) before import.
+# Do not put a real account id in this file.
+# authorizerResultTtlInSeconds is 0 (no gateway cache). See the README.
+openapi: "3.0.1"
+info:
+  title: external-api
+  version: "1.0.0"
+  description: >
+    External API. API Gateway invokes the Okta REQUEST authorizer, then the proxy Lambda.
+    Explicit paths and the greedy proxy path share that same pair of functions.
+
+x-amazon-apigateway-gateway-responses:
+  DEFAULT_4XX:
+    responseParameters:
+      gatewayresponse.header.Access-Control-Allow-Origin: "method.request.header.Origin"
+      gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Client-Id'"
+      gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS'"
+    responseTemplates:
+      application/json: "{\"message\":$context.error.messageString}"
+  DEFAULT_5XX:
+    responseParameters:
+      gatewayresponse.header.Access-Control-Allow-Origin: "method.request.header.Origin"
+      gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Client-Id'"
+      gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,PATCH,DELETE,HEAD,OPTIONS'"
+    responseTemplates:
+      application/json: "{\"message\":$context.error.messageString}"
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Concrete liveness path. Still requires LambdaAuth. The proxy forwards GET /health.
+      security:
+        - LambdaAuth: []
+      responses:
+        "200":
+          description: Upstream status and body, passed through by the proxy Lambda.
+        "401":
+          description: Missing identity headers, or the authorizer threw Unauthorized.
+        "500":
+          description: Authorizer or proxy failed before returning a response.
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: "arn:aws:apigateway:<<AWS_REGION>>:lambda:path/2015-03-31/functions/arn:aws:lambda:<<AWS_REGION>>:<<AWS_ACCOUNT_ID>>:function:<<ROUTER_FUNCTION_NAME>>/invocations"
+        passthroughBehavior: when_no_match
+        timeoutInMillis: 29000
+
+  /payment/token:
+    post:
+      operationId: postPaymentToken
+      summary: Concrete business path. Same authorizer and the same proxy Lambda as /{proxy+}.
+      security:
+        - LambdaAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Upstream status and body, passed through by the proxy Lambda.
+        "401":
+          description: Missing identity headers, or the authorizer threw Unauthorized.
+        "500":
+          description: Authorizer or proxy failed before returning a response.
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: "arn:aws:apigateway:<<AWS_REGION>>:lambda:path/2015-03-31/functions/arn:aws:lambda:<<AWS_REGION>>:<<AWS_ACCOUNT_ID>>:function:<<ROUTER_FUNCTION_NAME>>/invocations"
+        passthroughBehavior: when_no_match
+        timeoutInMillis: 29000
+
+  # API Gateway accepts {proxy+} in an imported OpenAPI document. A general OpenAPI
+  # linter may reject the '+' marker. Explicit paths above win over this greedy path.
+  /{proxy+}:
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+    x-amazon-apigateway-any-method:
+      operationId: proxyAny
+      summary: Catch-all. ANY includes GET, POST, PUT, PATCH, DELETE, HEAD, and OPTIONS.
+      security:
+        - LambdaAuth: []
+      responses:
+        "200":
+          description: Upstream status and body, passed through by the proxy Lambda.
+        "401":
+          description: Missing identity headers, or the authorizer threw Unauthorized.
+        "500":
+          description: Authorizer or proxy failed before returning a response.
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: "arn:aws:apigateway:<<AWS_REGION>>:lambda:path/2015-03-31/functions/arn:aws:lambda:<<AWS_REGION>>:<<AWS_ACCOUNT_ID>>:function:<<ROUTER_FUNCTION_NAME>>/invocations"
+        passthroughBehavior: when_no_match
+        timeoutInMillis: 29000
+
+components:
+  securitySchemes:
+    LambdaAuth:
+      type: apiKey
+      name: Unused
+      in: header
+      x-amazon-apigateway-authtype: custom
+      x-amazon-apigateway-authorizer:
+        type: request
+        # Both headers must be present. API Gateway returns 401 without calling Lambda if either is missing.
+        # The Java authorizer validates Authorization only. X-Client-Id is part of the identity source, matching
+        # the team's import, and is not checked inside the function.
+        identitySource: "method.request.header.Authorization,method.request.header.X-Client-Id"
+        # 0 disables the API Gateway authorizer result cache, so every request runs Okta introspect.
+        # The earlier SAM shorthand used ReauthorizeEvery 300. Raise this only if that cache is acceptable.
+        authorizerResultTtlInSeconds: 0
+        authorizerUri: "arn:aws:apigateway:<<AWS_REGION>>:lambda:path/2015-03-31/functions/arn:aws:lambda:<<AWS_REGION>>:<<AWS_ACCOUNT_ID>>:function:<<LAMBDA_AUTHORIZER_NAME>>/invocations"

@@ -8,12 +8,12 @@ final class AuthorizerSupport {
     private AuthorizerSupport() {
     }
 
-/**
- * API Gateway caches the Allow policy for ReauthorizeEvery seconds and reuses it for every request
- * with the same Authorization header. The returned resource therefore allows every method and path
- * on that stage. A policy that names only the current methodArn would deny the next path until the
- * gateway cache expires.
- */
+    /**
+     * Allow every method and path on the stage. specification.yaml sets authorizerResultTtlInSeconds
+     * to 0, so API Gateway does not reuse this policy today. The stage wildcard stays valid if that
+     * TTL is raised: a policy that names only the current methodArn would deny the next path until
+     * the gateway cache expired.
+     */
     static String stageWildcard(String methodArn) {
         if (methodArn == null || methodArn.isBlank()) {
             throw new IllegalStateException("methodArn is missing");

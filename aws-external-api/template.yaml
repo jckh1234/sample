@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  External API sample. API Gateway REST API, Okta REQUEST authorizer Lambda,
-  and a proxy Lambda in front of an internal service. Okta client_secret is
-  read from HashiCorp Vault at runtime. This template contains parameters
-  only — no real secrets.
+  External API sample. The REST API is the OpenAPI file imported by
+  DefinitionUri (see specification.yaml). This template creates the Okta
+  authorizer Lambda and the proxy Lambda, plus invoke permissions for API
+  Gateway. It does not use SAM Auth or Api Events. No real secrets.
 
 Parameters:
   StageName:
@@ -12,6 +12,22 @@ Parameters:
     Default: prod
     AllowedPattern: "^[A-Za-z0-9]+$"
     Description: API Gateway stage name.
+
+  AuthorizerFunctionName:
+    Type: String
+    Default: external-api-okta-authorizer
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    Description: >
+      Must match <<LAMBDA_AUTHORIZER_NAME>> in the rendered OpenAPI file.
+      Render specification.yaml with the same name before sam deploy.
+
+  ProxyFunctionName:
+    Type: String
+    Default: external-api-proxy
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"
+    Description: >
+      Must match <<ROUTER_FUNCTION_NAME>> in the rendered OpenAPI file.
+      The OpenAPI paths call this function with aws_proxy.
 
   OktaIssuer:
     Type: String
@@ -114,30 +130,22 @@ Rules:
         AssertDescription: Set ProxySubnetIds and ProxySecurityGroupIds together, or leave both empty.
 
 Resources:
+  # Routes, the REQUEST authorizer, and aws_proxy integrations live in the OpenAPI
+  # file. scripts/render-specification.sh replaces <<...>> and writes
+  # build/specification.yaml. SAM uploads that file; it does not generate
+  # methods from Auth or Events.
   ExternalApi:
     Type: AWS::Serverless::Api
     Properties:
       Name: !Sub ${AWS::StackName}-external-api
       StageName: !Ref StageName
       EndpointConfiguration: REGIONAL
-      Auth:
-        DefaultAuthorizer: OktaAuthorizer
-        Authorizers:
-          OktaAuthorizer:
-            FunctionArn: !GetAtt OktaAuthorizerFunction.Arn
-            FunctionPayloadType: REQUEST
-            Identity:
-              Headers:
-                - Authorization
-              # API Gateway caches the authorizer IAM policy and context for this
-              # many seconds, keyed by the Authorization header. The Allow policy
-              # therefore covers the whole stage (see the authorizer code).
-              ReauthorizeEvery: 300
+      DefinitionUri: build/specification.yaml
 
   OktaAuthorizerFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-okta-authorizer
+      FunctionName: !Ref AuthorizerFunctionName
       Runtime: java17
       MemorySize: 512
       Timeout: 20
@@ -161,8 +169,8 @@ Resources:
     Metadata:
       BuildMethod: maven
 
-  # Resource-based policy: only this API's authorizer may invoke the function.
-  # SAM also adds an equivalent statement when it transforms Auth.Authorizers.
+  # There is no SAM Auth block, so this is the invoke permission for the authorizer.
+  # SourceArn is this API's authorizers, not Principal "*".
   OktaAuthorizerInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -174,7 +182,7 @@ Resources:
   ProxyFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-proxy
+      FunctionName: !Ref ProxyFunctionName
       Runtime: java17
       MemorySize: 512
       Timeout: 29
@@ -202,20 +210,11 @@ Resources:
         - SubnetIds: !Ref ProxySubnetIds
           SecurityGroupIds: !Ref ProxySecurityGroupIds
         - !Ref AWS::NoValue
-      Events:
-        ProxyAny:
-          Type: Api
-          Properties:
-            RestApiId: !Ref ExternalApi
-            Path: /{proxy+}
-            Method: ANY
-            Auth:
-              Authorizer: OktaAuthorizer
     Metadata:
       BuildMethod: maven
 
-  # Resource-based policy: only methods on this API stage may invoke the proxy.
-  # SAM also adds a statement for the ProxyAny event. Neither statement uses Principal "*".
+  # There is no Api event, so this is the invoke permission for the proxy.
+  # SourceArn is this API stage, not Principal "*".
   ProxyInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
