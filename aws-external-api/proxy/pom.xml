@@ -37,7 +37,23 @@
 
   <build>
     <finalName>api-proxy</finalName>
+    <testResources>
+      <testResource>
+        <directory>src/test/resources</directory>
+      </testResource>
+      <testResource>
+        <directory>${project.basedir}/../events</directory>
+        <targetPath>events</targetPath>
+        <includes>
+          <include>*.json</include>
+        </includes>
+      </testResource>
+    </testResources>
     <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>

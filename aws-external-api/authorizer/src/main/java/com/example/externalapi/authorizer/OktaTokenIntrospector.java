@@ -38,6 +38,9 @@ final class OktaTokenIntrospector {
         if (response.status() == 401 || response.status() == 403) {
             throw new IllegalStateException("okta introspect rejected the client credentials");
         }
+        if (response.status() == 400) {
+            throw new UnauthorizedException();
+        }
         if (response.status() != 200) {
             throw new IllegalStateException("okta introspect status " + response.status());
         }

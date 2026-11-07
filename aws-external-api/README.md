@@ -108,7 +108,7 @@ LAMBDA_AUTHORIZER_NAME=external-api-okta-authorizer \
 
 API Gateway 先叫 authorizer，通過之後才叫 integration。`specification.yaml` 的每個方法都寫了 `security: - LambdaAuth: []`，所以 proxy 收到請求時，Gateway 已經接受這次驗證。Proxy 不再打 Okta，直接讀 `requestContext.authorizer`。
 
-拒絕時 authorizer 丟出 message 恰好是 `Unauthorized` 的例外。API Gateway 回 **401**，**不會**呼叫 proxy。缺 Bearer、introspect `active` 不是 true、`iss` 不符、有設定 audience 但 `aud` 不符、或沒有 `sub`，都走這條路。
+拒絕時 authorizer 丟出 message 恰好是 `Unauthorized` 的例外。API Gateway 回 **401**，**不會**呼叫 proxy。缺 Bearer、introspect `active` 不是 true、Okta introspect 回 400、`iss` 不符、有設定 audience 但 `aud` 不符、或沒有 `sub`，都走這條路。Okta 回 401/403（client credentials 被拒）或 5xx 仍是 authorizer 錯誤，呼叫端看到 **500**。
 
 Vault 或 Okta 自己失敗（網路、AppRole 登入失敗、client credentials 被拒）是設定或相依服務的問題，不是這張 access token 無效。這種情況丟一般例外，API Gateway 會把它當成 authorizer 錯誤，呼叫端看到 **500**。這樣才分得出「token 不行」和「authorizer 打不到 Okta / Vault」。
 
@@ -328,7 +328,15 @@ curl -sS "${EXTERNAL_API_URL}orders/42?status=open" \
   -H "X-Client-Id: example-client"
 ```
 
-本機測試不需要 AWS。`mvn test` 用 JDK 的 `HttpServer` 充當 Vault、Okta 與內部服務。
+本機測試不需要 AWS，也不會連到真正的 Okta 或 Vault。`mvn test` 用 JDK 的 `HttpServer` 充當 Vault、Okta 與內部服務。`AuthorizerEventFileTest` 讀 `events/authorizer-request.json`，`ProxyEventFileTest` 讀 `events/proxy-request.json`。
+
+## 在 Eclipse 跑測試
+
+用 Eclipse 的 Maven 匯入這個目錄（Existing Maven Projects，選 `aws-external-api/pom.xml`）。JDK 要 17 以上。
+
+- 整個範例：在 Package Explorer 對 `aws-external-api` 按右鍵 → Run As → Maven test。目標就是 `mvn test`。
+- 單一類別：打開 `AuthorizerEventFileTest` 或 `ProxyEventFileTest` → Run As → JUnit Test。Maven 會把 `events/` 放到 test classpath；若工作目錄是 module 或這個專案根目錄，測試也會直接讀 `events/*.json`。
+- 命令列在 `aws-external-api/` 執行 `mvn test`。依賴已在本機 Maven repository 時，可再加 `-o` 離線跑。
 
 ## 安全注意事項
 
