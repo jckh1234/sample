@@ -1,0 +1,22 @@
+{
+  "type": "REQUEST",
+  "methodArn": "arn:aws:execute-api:us-east-1:123456789012:abc123/prod/GET/orders/42",
+  "resource": "/{proxy+}",
+  "path": "/orders/42",
+  "httpMethod": "GET",
+  "headers": {
+    "Authorization": "Bearer REPLACE_WITH_ACCESS_TOKEN"
+  },
+  "queryStringParameters": {
+    "status": "open"
+  },
+  "pathParameters": {
+    "proxy": "orders/42"
+  },
+  "requestContext": {
+    "path": "/prod/orders/42",
+    "stage": "prod",
+    "httpMethod": "GET",
+    "resourcePath": "/{proxy+}"
+  }
+}
