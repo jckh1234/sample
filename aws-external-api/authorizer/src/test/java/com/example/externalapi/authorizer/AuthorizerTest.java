@@ -122,11 +122,9 @@ class AuthorizerTest {
             byte[] requestBody = exchange.getRequestBody().readAllBytes();
             byte[] response;
             int status = 200;
-            if ("/v1/auth/approle/login".equals(path)) {
+            if ("/v1/auth/aws/login".equals(path)) {
                 logins.incrementAndGet();
-                JsonNode login = JSON.readTree(requestBody);
-                assertEquals("role-id", login.path("role_id").asText());
-                assertEquals("secret-id", login.path("secret_id").asText());
+                IamLoginFixture.assertLogin(JSON.readTree(requestBody));
                 assertEquals("admin/external", exchange.getRequestHeaders().getFirst("X-Vault-Namespace"));
                 response = """
                         {"auth":{"client_token":"vault-token"}}
@@ -166,7 +164,8 @@ class AuthorizerTest {
             OktaAuthorizerHandler handler = new OktaAuthorizerHandler(
                     config(base, "admin/external"),
                     HttpExchanges.client(),
-                    Clock.systemUTC());
+                    Clock.systemUTC(),
+                    IamLoginFixture.signer());
             IamPolicyResponse first = handler.handleRequest(allowEvent(), null);
             IamPolicyResponse second = handler.handleRequest(allowEvent(), null);
             assertEquals("00u1", first.getPrincipalId());
@@ -178,7 +177,7 @@ class AuthorizerTest {
             String serialized = JSON.writeValueAsString(first);
             assertFalse(serialized.contains("access-token"));
             assertFalse(serialized.contains("okta-client-secret"));
-            assertFalse(serialized.contains("secret-id"));
+            assertFalse(serialized.contains("wJalrXUtnFEMI"));
         } finally {
             server.stop(0);
         }
@@ -188,6 +187,7 @@ class AuthorizerTest {
     void inactiveTokenThrowsUnauthorized() throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
+            exchange.getRequestBody().readAllBytes();
             byte[] response;
             String path = exchange.getRequestURI().getPath();
             if (path.endsWith("/introspect")) {
@@ -212,7 +212,8 @@ class AuthorizerTest {
         server.start();
         try {
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
-            OktaAuthorizerHandler handler = new OktaAuthorizerHandler(config(base, null), HttpExchanges.client(), Clock.systemUTC());
+            OktaAuthorizerHandler handler = new OktaAuthorizerHandler(
+                    config(base, null), HttpExchanges.client(), Clock.systemUTC(), IamLoginFixture.signer());
             UnauthorizedException denied = assertThrows(UnauthorizedException.class, () -> handler.handleRequest(allowEvent(), null));
             assertEquals("Unauthorized", denied.getMessage());
         } finally {
@@ -226,6 +227,7 @@ class AuthorizerTest {
         AtomicInteger reads = new AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
+            exchange.getRequestBody().readAllBytes();
             String path = exchange.getRequestURI().getPath();
             byte[] response = path.endsWith("/login")
                     ? """
@@ -246,7 +248,7 @@ class AuthorizerTest {
         try {
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
             AuthorizerConfig config = config(base, null, 300);
-            VaultKvSecretCache cache = new VaultKvSecretCache(config, HttpExchanges.client(), clock);
+            VaultKvSecretCache cache = new VaultKvSecretCache(config, HttpExchanges.client(), clock, IamLoginFixture.signer());
             assertEquals("okta-client-secret", cache.clientSecret());
             assertEquals("okta-client-secret", cache.clientSecret());
             clock.advanceSeconds(299);
@@ -264,6 +266,7 @@ class AuthorizerTest {
         AtomicInteger reads = new AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
+            exchange.getRequestBody().readAllBytes();
             String path = exchange.getRequestURI().getPath();
             int status = 200;
             byte[] response;
@@ -290,7 +293,8 @@ class AuthorizerTest {
         server.start();
         try {
             String base = "http://127.0.0.1:" + server.getAddress().getPort();
-            VaultKvSecretCache cache = new VaultKvSecretCache(config(base, null, 300), HttpExchanges.client(), Clock.systemUTC());
+            VaultKvSecretCache cache = new VaultKvSecretCache(
+                    config(base, null, 300), HttpExchanges.client(), Clock.systemUTC(), IamLoginFixture.signer());
             assertThrows(IllegalStateException.class, cache::clientSecret);
             assertEquals("okta-client-secret", cache.clientSecret());
             assertEquals(2, reads.get());
@@ -305,7 +309,7 @@ class AuthorizerTest {
         env.remove("OKTA_ISSUER");
         IllegalStateException missing = assertThrows(IllegalStateException.class, () -> AuthorizerConfig.from(env));
         assertTrue(missing.getMessage().contains("OKTA_ISSUER"));
-        assertFalse(missing.getMessage().contains("secret-id"));
+        assertFalse(missing.getMessage().contains(IamLoginFixture.VAULT_ROLE));
     }
 
     private static APIGatewayCustomAuthorizerEvent allowEvent() {
@@ -338,8 +342,7 @@ class AuthorizerTest {
         env.put("OKTA_CLIENT_ID", "client-id");
         env.put("OKTA_AUDIENCE", "api://external");
         env.put("VAULT_ADDR", base);
-        env.put("VAULT_ROLE_ID", "role-id");
-        env.put("VAULT_SECRET_ID", "secret-id");
+        env.put("VAULT_AWS_AUTH_ROLE", IamLoginFixture.VAULT_ROLE);
         env.put("VAULT_OKTA_SECRET_PATH", "secret/data/external-api/okta");
         env.put("VAULT_SECRET_CACHE_SECONDS", Integer.toString(cacheSeconds));
         if (namespace != null) {

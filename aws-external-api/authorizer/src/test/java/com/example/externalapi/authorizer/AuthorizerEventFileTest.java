@@ -57,6 +57,7 @@ class AuthorizerEventFileTest {
             assertEquals(1, logins.get());
             assertEquals(1, reads.get());
             assertEquals(1, introspects.get());
+            IamLoginFixture.assertLogin(vault.lastLogin());
         }
     }
 
@@ -87,6 +88,7 @@ class AuthorizerEventFileTest {
     private static final class LocalOktaVault implements AutoCloseable {
         private final HttpServer server;
         private final String base;
+        private volatile JsonNode lastLogin;
 
         LocalOktaVault(boolean active, int introspectStatus, AtomicInteger logins, AtomicInteger reads, AtomicInteger introspects)
                 throws IOException {
@@ -96,10 +98,12 @@ class AuthorizerEventFileTest {
                 byte[] requestBody = exchange.getRequestBody().readAllBytes();
                 byte[] response;
                 int status = 200;
-                if ("/v1/auth/approle/login".equals(path)) {
+                if ("/v1/auth/aws/login".equals(path)) {
                     logins.incrementAndGet();
                     JsonNode login = JSON.readTree(requestBody);
-                    if (!"role-id".equals(login.path("role_id").asText()) || !"secret-id".equals(login.path("secret_id").asText())) {
+                    lastLogin = login;
+                    if (!IamLoginFixture.VAULT_ROLE.equals(login.path("role").asText())
+                            || !"POST".equals(login.path("iam_http_request_method").asText())) {
                         status = 401;
                     }
                     response = """
@@ -150,17 +154,22 @@ class AuthorizerEventFileTest {
             base = "http://127.0.0.1:" + server.getAddress().getPort();
         }
 
+        JsonNode lastLogin() {
+            return lastLogin;
+        }
+
         OktaAuthorizerHandler handler() {
             Map<String, String> env = new LinkedHashMap<>();
             env.put("OKTA_ISSUER", base + "/oauth2/default");
             env.put("OKTA_CLIENT_ID", "client-id");
             env.put("OKTA_AUDIENCE", "api://external");
             env.put("VAULT_ADDR", base);
-            env.put("VAULT_ROLE_ID", "role-id");
-            env.put("VAULT_SECRET_ID", "secret-id");
+            env.put("VAULT_AWS_AUTH_ROLE", IamLoginFixture.VAULT_ROLE);
+            env.put("VAULT_AUTH_MOUNT", "aws");
             env.put("VAULT_OKTA_SECRET_PATH", "secret/data/external-api/okta");
             env.put("VAULT_SECRET_CACHE_SECONDS", "0");
-            return new OktaAuthorizerHandler(AuthorizerConfig.from(env), HttpExchanges.client(), Clock.systemUTC());
+            return new OktaAuthorizerHandler(
+                    AuthorizerConfig.from(env), HttpExchanges.client(), Clock.systemUTC(), IamLoginFixture.signer());
         }
 
         @Override

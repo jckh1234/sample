@@ -6,7 +6,7 @@
 
 **外部呼叫端 → API Gateway REST API → Okta authorizer Lambda → proxy Lambda → 內部服務**
 
-Okta introspect 用的 client secret 放在 HashiCorp Vault（AppRole + KV v2）。template 裡只有 Parameters，沒有真的憑證。
+Okta introspect 用的 client secret 放在 HashiCorp Vault（AWS IAM auth + KV v2）。template 裡只有 Parameters，沒有真的憑證，也沒有 AppRole `secret_id`。
 
 API 本體寫在 `specification.yaml`，用 API Gateway 的 OpenAPI 擴充，不是 SAM 的 `Auth:` / `Events:`。`template.yaml` 只建立兩支 Lambda、環境變數，以及 API Gateway 呼叫它們的權限，再用 `DefinitionUri` 匯入渲染後的 OpenAPI。
 
@@ -26,7 +26,7 @@ sequenceDiagram
 
   Client->>APIGW: HTTPS，Authorization 與 X-Client-Id
   APIGW->>Auth: REQUEST event（authorizerResultTtlInSeconds 為 0，每次都呼叫）
-  Auth->>Vault: AppRole login，再讀 KV v2（client secret 快取過期時）
+  Auth->>Vault: AWS IAM login（簽過的 GetCallerIdentity），再讀 KV v2（client secret 快取過期時）
   Vault-->>Auth: client_secret
   Auth->>Okta: POST {issuer}/v1/introspect
   Okta-->>Auth: active 與 claims
@@ -110,13 +110,13 @@ API Gateway 先叫 authorizer，通過之後才叫 integration。`specification.
 
 拒絕時 authorizer 丟出 message 恰好是 `Unauthorized` 的例外。API Gateway 回 **401**，**不會**呼叫 proxy。缺 Bearer、introspect `active` 不是 true、Okta introspect 回 400、`iss` 不符、有設定 audience 但 `aud` 不符、或沒有 `sub`，都走這條路。Okta 回 401/403（client credentials 被拒）或 5xx 仍是 authorizer 錯誤，呼叫端看到 **500**。
 
-Vault 或 Okta 自己失敗（網路、AppRole 登入失敗、client credentials 被拒）是設定或相依服務的問題，不是這張 access token 無效。這種情況丟一般例外，API Gateway 會把它當成 authorizer 錯誤，呼叫端看到 **500**。這樣才分得出「token 不行」和「authorizer 打不到 Okta / Vault」。
+Vault 或 Okta 自己失敗（網路、AWS IAM 登入失敗、client credentials 被拒）是設定或相依服務的問題，不是這張 access token 無效。這種情況丟一般例外，API Gateway 會把它當成 authorizer 錯誤，呼叫端看到 **500**。這樣才分得出「token 不行」和「authorizer 打不到 Okta / Vault」。
 
 `authorizerResultTtlInSeconds` 在 `specification.yaml` 設為 **0**。API Gateway 不重用 authorizer 的 IAM policy 與 context，所以每次請求都會進到 Okta introspect。這和 SAM `ReauthorizeEvery: 300` 不同；0 是為了對齊團隊那份 OpenAPI（不快取）。若把這個數字改成 300，同一組 identity source 在 300 秒內不會再呼叫 authorizer，撤銷的 token 要等快取過期才看得到。
 
 Allow 的 `Resource` 仍是該 stage 的 `*/*`，不是當下這一個 `methodArn`。TTL 為 0 時 Gateway 不會拿這份 policy 去套別的路徑；若以後把 TTL 調高，stage wildcard 才不會讓下一個路徑被舊 policy 拒絕。
 
-Lambda 記憶體裡另外有一份快取，只放 **Okta client secret**（`VAULT_SECRET_CACHE_SECONDS`，預設 300，`0` 表示不快取）。它不快取 access token，也不快取 Vault token。Secret 過期後會重新 AppRole login，再讀一次 KV。Token 撤銷由每次請求的 introspect 處理；這份 secret 快取只影響能不能登入 Okta。
+Lambda 記憶體裡另外有一份快取，只放 **Okta client secret**（`VAULT_SECRET_CACHE_SECONDS`，預設 300，`0` 表示不快取）。它不快取 access token，也不快取 Vault token。Secret 過期後會重新簽名並做 AWS IAM login，再讀一次 KV。Token 撤銷由每次請求的 introspect 處理；這份 secret 快取只影響能不能登入 Okta。
 
 ## 各 Lambda 看到的 path 與 query
 
@@ -217,17 +217,25 @@ JWKS 的取捨：Lambda 自己驗 JWT 簽章，不必持有 client secret，延�
 
 這份 spec 的 `authorizerResultTtlInSeconds` 是 0，所以 introspect 每次請求都會跑到。若把 TTL 調高，兩種驗證都要等 Gateway 快取過期才會再執行。
 
-## Vault AppRole 與環境變數
+## Vault AWS IAM auth 與環境變數
 
-Client secret 不在 template、不在 jar、也不在 log。Authorizer 啟動後讀環境變數，需要 secret 時才向 Vault 要。
+Client secret 不在 template、不在 jar、也不在 log。Authorizer 不持有 Vault 密碼。需要 secret 時，它用 Lambda 執行角色的臨時憑證在本地簽一張 `sts:GetCallerIdentity`，交給 Vault 驗證。
 
-1. `POST {VAULT_ADDR}/v1/auth/approle/login`，JSON body 為 `role_id` 與 `secret_id`。有 `VAULT_NAMESPACE` 就加 `X-Vault-Namespace`。
-2. 從回應的 `auth.client_token` 取得這次用的 Vault token。這個 token 不進記憶體快取。
-3. `GET {VAULT_ADDR}/v1/{VAULT_OKTA_SECRET_PATH}`，header 為 `X-Vault-Token`。KV v2 的值在 `data.data.{VAULT_OKTA_SECRET_KEY}`。
+1. 用預設憑證鏈簽名。Lambda 上這就是該函式的執行角色。請求是 `POST https://sts.{region}.amazonaws.com/`，body 為 `Action=GetCallerIdentity&Version=2011-06-15`。Region 取 `AWS_REGION`，否則 `AWS_DEFAULT_REGION`，否則 `us-east-1`。中國區 host 用 `amazonaws.com.cn`。Authorizer **自己不呼叫** STS。
+2. `POST {VAULT_ADDR}/v1/auth/{VAULT_AUTH_MOUNT}/login`。`VAULT_AUTH_MOUNT` 預設 `aws`。JSON 欄位是 `role`（`VAULT_AWS_AUTH_ROLE`）、`iam_http_request_method`、以及 Base64 過的 `iam_request_url`、`iam_request_body`、`iam_request_headers`。有 `VAULT_NAMESPACE` 就加 `X-Vault-Namespace`。
+3. Vault 把這張簽過的請求重放給 STS，確認 caller 是被綁定的 IAM principal，再核發 Vault token。這個 token 不進記憶體快取。
+4. `GET {VAULT_ADDR}/v1/{VAULT_OKTA_SECRET_PATH}`，header 為 `X-Vault-Token`。KV v2 的值在 `data.data.{VAULT_OKTA_SECRET_KEY}`。Okta client secret 仍以 `VAULT_SECRET_CACHE_SECONDS` 快取。
 
 `VAULT_OKTA_SECRET_PATH` 是 `/v1/` 後面的 API path，**要含 KV v2 的 `data` 段**。程式不會把邏輯路徑自動改寫成 data path。
 
 範例：secret 在 KV v2 mount `secret`、路徑 `external-api/okta`、欄位 `client_secret` 時，`VAULT_OKTA_SECRET_PATH=secret/data/external-api/okta`，`VAULT_OKTA_SECRET_KEY=client_secret`。
+
+執行角色與 Vault role 是兩件不同的東西：
+
+- **Lambda 執行角色**是 IAM role。SAM 用 `AWSLambdaBasicExecutionRole` 建立，stack output `OktaAuthorizerExecutionRoleArn` 就是它的 ARN。Lambda 啟動時注入臨時憑證（含 session token，簽名會帶上 `X-Amz-Security-Token`）。因為 STS 是 Vault 去呼叫，這個角色不需要 `sts:GetCallerIdentity` 權限。
+- **`VAULT_AWS_AUTH_ROLE`** 是 Vault `auth/aws` 裡的 role 名稱，不是 IAM ARN。在 Vault 把上面的執行角色 ARN 綁到這個 role，例如 `bound_iam_principal_arn`，`auth_type=iam`，policy 只允許讀那一筆 Okta secret。
+
+和 AppRole 的差別：AppRole 要把 `role_id` 和 `secret_id` 放進 Lambda 環境變數，`secret_id` 本身就是登入 Vault 的密碼，能讀函式設定的人就能登入。IAM auth 的環境變數只有 Vault 位址、auth mount 和 Vault role 名稱；能登入的是「這一個執行角色的臨時憑證」，不是另一組可以複製走的 secret。換綁定要改 Vault role 上的 IAM ARN，而不是輪替 `secret_id`。Vault 必須能連到簽名前用的那個 STS endpoint。
 
 | 環境變數 | 使用它的函式 | 說明 |
 | --- | --- | --- |
@@ -235,8 +243,8 @@ Client secret 不在 template、不在 jar、也不在 log。Authorizer 啟動�
 | `OKTA_CLIENT_ID` | authorizer | Introspect 的 Basic auth 使用者名稱 |
 | `OKTA_AUDIENCE` | authorizer | 選填。空白就略過 `aud` 檢查 |
 | `VAULT_ADDR` | authorizer | 例如 `https://vault.example.com:8200`，不要加 path |
-| `VAULT_ROLE_ID` | authorizer | AppRole `role_id` |
-| `VAULT_SECRET_ID` | authorizer | AppRole `secret_id` |
+| `VAULT_AWS_AUTH_ROLE` | authorizer | Vault AWS auth role 名稱，例如 `external-api-authorizer` |
+| `VAULT_AUTH_MOUNT` | authorizer | 選填。auth mount，預設 `aws` |
 | `VAULT_OKTA_SECRET_PATH` | authorizer | KV v2 data path，例如 `secret/data/external-api/okta` |
 | `VAULT_OKTA_SECRET_KEY` | authorizer | 預設 `client_secret` |
 | `VAULT_NAMESPACE` | authorizer | 選填。Vault Enterprise namespace；OSS 留空 |
@@ -264,7 +272,7 @@ SAM：
 sam deploy --guided
 ```
 
-或用參數覆蓋（不要把真的 `secret_id` 留在 shell 歷史或提交進 git）：
+或用參數覆蓋（不要把真的 Okta client id 留在 shell 歷史或提交進 git）：
 
 ```bash
 sam deploy \
@@ -276,8 +284,8 @@ sam deploy \
     OktaClientId=REPLACE_ME \
     OktaAudience=api://external \
     VaultAddr=https://vault.example.com:8200 \
-    VaultRoleId=REPLACE_ME \
-    VaultSecretId=REPLACE_ME \
+    VaultAwsAuthRole=external-api-authorizer \
+    VaultAuthMount=aws \
     VaultOktaSecretPath=secret/data/external-api/okta \
     UpstreamBaseUrl=https://internal.example.net/api
 ```
@@ -286,7 +294,7 @@ sam deploy \
 
 主控台：Lambda → 該函式 → Configuration → Environment variables。名稱要和上表一致。改完之後，新的 execution environment 會看到新值；已經活著的環境要等它被換掉，或等 client secret 的 TTL 到期才會重讀 Vault。目前 Gateway 的 authorizer TTL 是 0，所以下一次請求就會用到新的 authorizer 程式。改 `authorizerResultTtlInSeconds` 則要重新匯入 OpenAPI。
 
-`VaultRoleId` 與 `VaultSecretId` 在 template 設了 `NoEcho`，CloudFormation 日誌不會印出值。Lambda 環境變數本身對能讀函式設定的人仍然可見。這個範例依需求把 AppRole 放在環境變數；正式環境若要再縮小可見範圍，換掉 `VaultKvSecretCache` 的讀取方式即可，introspect 流程不用改。
+IAM auth 不再把 Vault `secret_id` 放進環境變數。`VAULT_AWS_AUTH_ROLE` 只是 Vault role 名稱。能登入 Vault 的是執行角色的臨時憑證。
 
 ## 建置與部署
 
@@ -340,8 +348,8 @@ curl -sS "${EXTERNAL_API_URL}orders/42?status=open" \
 
 ## 安全注意事項
 
-- 不要把 access token、Okta client secret、Vault `secret_id`、Vault token 寫進日誌。這個範例的 authorizer 只記 `allow`、`deny: ...` 原因，或錯誤的例外類別名稱。Proxy 只記 method、proxy path 與上游 status，不記 query、body 或 `Authorization`。
-- Template 沒有真實憑證。`VaultRoleId` 與 `VaultSecretId` 是 `NoEcho` 參數。不要提交填好的 `samconfig.toml`。
+- 不要把 access token、Okta client secret、簽過的 `Authorization`、`X-Amz-Security-Token` 或 Vault token 寫進日誌。這個範例的 authorizer 只記 `allow`、`deny: ...` 原因，或錯誤的例外類別名稱。Proxy 只記 method、proxy path 與上游 status，不記 query、body 或 `Authorization`。
+- Template 沒有真實憑證，也沒有 AppRole `secret_id`。不要提交填好的 `samconfig.toml`。
 - 兩個 Lambda 的 resource-based policy 都把 `lambda:InvokeFunction` 限制在 `apigateway.amazonaws.com`，而且 `SourceArn` 只涵蓋這一個 API。Authorizer 是 `.../{apiId}/authorizers/*`。Proxy 是 `.../{apiId}/{stage}/*/*`。OpenAPI 沒有設 `authorizerCredentials` 或 integration `credentials`，所以 Gateway 靠這兩份 resource policy 呼叫 Lambda，而不是另一個 IAM role。Principal 不是 `"*"`。
 - Execution role 只給日誌。Authorizer 是 `AWSLambdaBasicExecutionRole`。Proxy 在沒有 VPC 時也是這個角色；有設 subnet 時改為 `AWSLambdaVPCAccessExecutionRole`（日誌加上建立 ENI 的權限）。它們不能呼叫對方，也沒有其他 AWS API 權限。
 - 不要把呼叫端的 `Authorization` 轉給內部服務。驗證已經在 authorizer 做完。內部服務若要知道是誰，讀 `X-User-Sub`。Proxy 會覆寫呼叫端傳來的 `X-User-*`。
