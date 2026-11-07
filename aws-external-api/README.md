@@ -8,7 +8,9 @@
 
 Okta introspect 用的 client secret 放在 HashiCorp Vault（AppRole + KV v2）。template 裡只有 Parameters，沒有真的憑證。
 
-這是可以照著複製的參考範例，不是已經硬化的正式系統。Java 為 17。兩個 Lambda 都是獨立的 Maven module，上面有一個 aggregator `pom.xml`。
+API 本體寫在 `specification.yaml`，用 API Gateway 的 OpenAPI 擴充，不是 SAM 的 `Auth:` / `Events:`。`template.yaml` 只建立兩支 Lambda、環境變數，以及 API Gateway 呼叫它們的權限，再用 `DefinitionUri` 匯入渲染後的 OpenAPI。
+
+這是可以照著複製的參考範例，不是已經硬化的正式系統。Java 為 17。兩個 Lambda 都是獨立的 Maven module，上面有一個 aggregator `pom.xml`。Java authorizer（Okta introspect + Vault）和 proxy 的行為與先前相同。
 
 ## 架構
 
@@ -22,8 +24,8 @@ sequenceDiagram
   participant Proxy as Proxy Lambda
   participant Internal as 內部服務
 
-  Client->>APIGW: HTTPS，Authorization: Bearer access token
-  APIGW->>Auth: REQUEST event（authorizer 快取未命中時）
+  Client->>APIGW: HTTPS，Authorization 與 X-Client-Id
+  APIGW->>Auth: REQUEST event（authorizerResultTtlInSeconds 為 0，每次都呼叫）
   Auth->>Vault: AppRole login，再讀 KV v2（client secret 快取過期時）
   Vault-->>Auth: client_secret
   Auth->>Okta: POST {issuer}/v1/introspect
@@ -36,23 +38,85 @@ sequenceDiagram
   APIGW-->>Client: HTTP 回應
 ```
 
-`template.yaml` 用 `AWS::Serverless::Api` 建 REST API。預設 authorizer 是 `OktaAuthorizer`（REQUEST）。Identity source 是 header `Authorization`，`ReauthorizeEvery` 為 300 秒。Proxy 掛在 `ANY /{proxy+}`，integration 是 `AWS_PROXY`（SAM 對 Lambda event 的預設）。根路徑 `/` 沒有方法；呼叫時要帶一段 path，例如 `/orders/42`。
+`specification.yaml` 定義三條路徑，都掛 `LambdaAuth`，integration 都是同一支 proxy Lambda：
+
+| 路徑 | 方法 | 誰先處理 |
+| --- | --- | --- |
+| `/health` | `GET` | 明確路徑。比 `/{proxy+}` 優先 |
+| `/payment/token` | `POST` | 明確的業務路徑，同樣走 authorizer 再走 proxy |
+| `/{proxy+}` | `ANY` | 其餘路徑。`+` 是 API Gateway 的 greedy 標記 |
+
+根路徑 `/` 沒有方法。`/{proxy+}` 不會吃掉上面兩條明確路徑；API Gateway 以較具體的資源為準。OpenAPI 工具若嚴格檢查 path template，可能不接受 `{proxy+}` 的 `+`。API Gateway 匯入時接受這個寫法，所以明確路徑和 catch-all 可以放在同一份檔案。
 
 Authorizer 預設不進 VPC，因為它要打 Okta 與 Vault。Proxy 的 `VpcConfig` 用 `ProxySubnetIds` / `ProxySecurityGroupIds` 控制：兩個都留空就省略 `VpcConfig`；兩個都有值才把 proxy 放進 VPC。template 裡也留了靜態寫法的註解。
 
+## 為什麼這份設定不是 SAM Auth 語法
+
+SAM 可以用 `AWS::Serverless::Api` 的 `Auth.Authorizers` 加上函式上的 `Events: Type: Api` 讓轉換程式自己產生方法、authorizer 與 integration。那樣的 template 較短，但路由不在一份 OpenAPI 檔裡，和團隊用 `specification.yaml` 匯入 API Gateway 的方式不同。
+
+這份範例改成 OpenAPI 為準：
+
+- `specification.yaml` 是給人看、給 CI 替換的原始檔，裡面是 `<<AWS_REGION>>` 這類佔位符。
+- `scripts/render-specification.sh` 做 CI 會做的字串替換，寫出 `build/specification.yaml`。這個輸出不進 git。
+- `template.yaml` 的 `ExternalApi` 只有 `DefinitionUri: build/specification.yaml`。沒有 `Auth:`，proxy 函式上也沒有 `Events:`。
+- 兩支 Lambda 仍由 SAM 建置。函式名稱是參數 `AuthorizerFunctionName`、`ProxyFunctionName`，預設值要和渲染時的 `<<LAMBDA_AUTHORIZER_NAME>>`、`<<ROUTER_FUNCTION_NAME>>` 相同。
+
+`DefinitionUri` 是 SAM 把一份 OpenAPI 檔上傳成 API body 的方式。CloudFormation 的 `AWS::Include` 則要求 S3 URI，而且會把檔案當成 template 片段。這份 spec 的 `<<...>>` 不是 CloudFormation 內建函數，所以先替換，再用 `DefinitionUri` 匯入。
+
+## OpenAPI 擴充怎麼對到兩支 Lambda
+
+| OpenAPI | 執行時 |
+| --- | --- |
+| `components.securitySchemes.LambdaAuth` | 自訂 authorizer 的名字。方法上寫 `security: - LambdaAuth: []` 就會先跑它 |
+| `type: apiKey`、`name: Unused`、`in: header` | API Gateway 對 Lambda authorizer 的固定寫法。真正的身份來源是 `identitySource`，不是這個 apiKey 名稱 |
+| `x-amazon-apigateway-authtype: custom` | 告訴 Gateway 這是 Lambda authorizer，不是 IAM 或 Cognito |
+| `x-amazon-apigateway-authorizer.type: request` | REQUEST authorizer。Lambda 收到 `APIGatewayCustomAuthorizerEvent`（method、path、query、headers），不是只拿到一顆 token |
+| `identitySource` | `Authorization` 與 `X-Client-Id`。兩個都要有，否則 Gateway 直接回 401，不呼叫 Lambda |
+| `authorizerUri` 的 `<<LAMBDA_AUTHORIZER_NAME>>` | Okta authorizer Lambda |
+| `authorizerResultTtlInSeconds: 0` | Gateway 不快取 authorizer 結果。每次請求都 introspect。檔案裡的註解說明若要改回 300 秒快取，改這個數字 |
+| `x-amazon-apigateway-integration.type: aws_proxy` | Lambda proxy integration。Proxy 收到 `APIGatewayProxyRequestEvent`，回傳 status 與 body |
+| 同一個 integration 的 `httpMethod: POST` | API Gateway **呼叫 Lambda** 用 POST。呼叫端的 GET 或 POST 仍在 event 的 `httpMethod` |
+| integration `uri` 的 `<<ROUTER_FUNCTION_NAME>>` | Proxy Lambda。`/health`、`/payment/token`、`/{proxy+}` 都指向它 |
+| `x-amazon-apigateway-gateway-responses` 的 `DEFAULT_4XX` / `DEFAULT_5XX` | Gateway 自己產生的 4XX/5XX（含 authorizer 的 401/500）加上 CORS 風格的 header。`Access-Control-Allow-Origin` 取 `method.request.header.Origin` |
+
+Java 程式沒有改職責。Authorizer 仍驗證 Bearer token、向 Vault 拿 client secret、Allow 時把 claim 放進 context。Proxy 仍轉送 method、path、query、body，並從 `requestContext.authorizer` 寫 `X-User-Sub`。`X-Client-Id` 只當 Gateway 的 identity source；這支 Lambda 不檢查它。若內部服務要看到這個 header，把它加進 `FORWARD_HEADERS`。
+
+Gateway response 的 CORS header 只出現在 Gateway 產生的錯誤。Proxy 成功轉送的回應不會自動加上這些 header。`/{proxy+}` 的 `ANY` 包含 `OPTIONS`，預檢也會進 authorizer。
+
+## `<<...>>` 佔位符
+
+這些 token 留在 git 裡的 `specification.yaml`。CI 在匯入前替換。本機用同一支 script。
+
+| 佔位符 | 換成 |
+| --- | --- |
+| `<<AWS_REGION>>` | 區域，例如 `us-east-1` |
+| `<<AWS_ACCOUNT_ID>>` | 12 碼帳號 |
+| `<<LAMBDA_AUTHORIZER_NAME>>` | Authorizer 函式名稱。要等於 template 參數 `AuthorizerFunctionName` |
+| `<<ROUTER_FUNCTION_NAME>>` | Proxy 函式名稱。要等於 template 參數 `ProxyFunctionName` |
+
+```bash
+AWS_REGION=us-east-1 \
+AWS_ACCOUNT_ID=123456789012 \
+ROUTER_FUNCTION_NAME=external-api-proxy \
+LAMBDA_AUTHORIZER_NAME=external-api-okta-authorizer \
+  ./scripts/render-specification.sh
+```
+
+沒給函式名稱時，script 用上面這兩個預設值，與 template 預設相同。渲染結果是 `build/specification.yaml`。帳號與區域不要提交。
+
 ## 為什麼 authorizer 先執行
 
-API Gateway 先叫 authorizer，通過之後才叫 integration。這個路由掛了 `OktaAuthorizer`，所以 proxy 收到請求時，Gateway 已經接受這次驗證。Proxy 不再打 Okta，直接讀 `requestContext.authorizer`。
+API Gateway 先叫 authorizer，通過之後才叫 integration。`specification.yaml` 的每個方法都寫了 `security: - LambdaAuth: []`，所以 proxy 收到請求時，Gateway 已經接受這次驗證。Proxy 不再打 Okta，直接讀 `requestContext.authorizer`。
 
 拒絕時 authorizer 丟出 message 恰好是 `Unauthorized` 的例外。API Gateway 回 **401**，**不會**呼叫 proxy。缺 Bearer、introspect `active` 不是 true、`iss` 不符、有設定 audience 但 `aud` 不符、或沒有 `sub`，都走這條路。
 
 Vault 或 Okta 自己失敗（網路、AppRole 登入失敗、client credentials 被拒）是設定或相依服務的問題，不是這張 access token 無效。這種情況丟一般例外，API Gateway 會把它當成 authorizer 錯誤，呼叫端看到 **500**。這樣才分得出「token 不行」和「authorizer 打不到 Okta / Vault」。
 
-`ReauthorizeEvery: 300` 是 **API Gateway 的 authorizer 結果快取**。同一段 `Authorization` header 在 300 秒內會重用同一份 IAM policy 和 context，authorizer Lambda 不會再被叫到。因此 Okta 端已經撤銷的 token，最久要等這 300 秒才會再被 introspect 看到。
+`authorizerResultTtlInSeconds` 在 `specification.yaml` 設為 **0**。API Gateway 不重用 authorizer 的 IAM policy 與 context，所以每次請求都會進到 Okta introspect。這和 SAM `ReauthorizeEvery: 300` 不同；0 是為了對齊團隊那份 OpenAPI（不快取）。若把這個數字改成 300，同一組 identity source 在 300 秒內不會再呼叫 authorizer，撤銷的 token 要等快取過期才看得到。
 
-因為這份 policy 會被拿去套在同一個 token 的其他 method 和 path 上，Allow 的 `Resource` 是該 stage 的 `*/*`，不是當下這一個 `methodArn`。若 policy 只允許當下的 `GET /orders/42`，下一個 path 會在快取過期前被同一份 policy 拒絕。
+Allow 的 `Resource` 仍是該 stage 的 `*/*`，不是當下這一個 `methodArn`。TTL 為 0 時 Gateway 不會拿這份 policy 去套別的路徑；若以後把 TTL 調高，stage wildcard 才不會讓下一個路徑被舊 policy 拒絕。
 
-Lambda 記憶體裡另外有一份快取，只放 **Okta client secret**（`VAULT_SECRET_CACHE_SECONDS`，預設 300，`0` 表示不快取）。它不快取 access token，也不快取 Vault token。Secret 過期後會重新 AppRole login，再讀一次 KV。這份快取跟 token 撤銷無關；會延遲撤銷生效的是 API Gateway 那 300 秒。
+Lambda 記憶體裡另外有一份快取，只放 **Okta client secret**（`VAULT_SECRET_CACHE_SECONDS`，預設 300，`0` 表示不快取）。它不快取 access token，也不快取 Vault token。Secret 過期後會重新 AppRole login，再讀一次 KV。Token 撤銷由每次請求的 introspect 處理；這份 secret 快取只影響能不能登入 Okta。
 
 ## 各 Lambda 看到的 path 與 query
 
@@ -61,9 +125,12 @@ Lambda 記憶體裡另外有一份快取，只放 **Okta client secret**（`VAUL
 ```http
 GET https://{apiId}.execute-api.{region}.amazonaws.com/prod/orders/42?status=open
 Authorization: Bearer eyJ...
+X-Client-Id: example-client
 ```
 
-REQUEST authorizer（`APIGatewayCustomAuthorizerEvent`）看得到 method、path、query、headers，**沒有 body**。Identity 只認 `Authorization` header，query 裡的 token 不會被拿來驗證。
+`X-Client-Id` 一定要帶。它在 `identitySource` 裡，缺了 Gateway 不會呼叫 authorizer。Java 只檢查 `Authorization`。
+
+REQUEST authorizer（`APIGatewayCustomAuthorizerEvent`）看得到 method、path、query、headers，**沒有 body**。Query 裡的 token 不會被拿來驗證。
 
 | 欄位 | Authorizer 看到的值 |
 | --- | --- |
@@ -90,7 +157,15 @@ Proxy（`APIGatewayProxyRequestEvent`）只有在 Allow 之後才會被叫到。
 | `requestContext.authorizer.sub` | authorizer context 裡的字串 |
 | `body` / `isBase64Encoded` | 有 body 時才有。Authorizer 看不到這段 |
 
-轉給內部服務的 URL 是 `UPSTREAM_BASE_URL` 接上 `pathParameters.proxy`。Base URL 若是 `https://internal.example.net/api`，上面這支呼叫會變成 `https://internal.example.net/api/orders/42?status=open`。Path 以 `{proxy+}` 的值為準；沒有這個參數時，才從 `path` 去掉開頭的 `/{stage}`。
+轉給內部服務的 URL 是 `UPSTREAM_BASE_URL` 接上路徑。`/{proxy+}` 用 `pathParameters.proxy`。`/health` 與 `/payment/token` 沒有這個參數，proxy 改從 `path` 去掉開頭的 `/`（若 path 以 `/{stage}/` 開頭會先去掉 stage）。
+
+| 呼叫 | 轉給內部服務的相對路徑 |
+| --- | --- |
+| `GET /health` | `health` |
+| `POST /payment/token` | `payment/token` |
+| `GET /orders/42` | `orders/42` |
+
+Base URL 若是 `https://internal.example.net/api`，`GET /orders/42?status=open` 會變成 `https://internal.example.net/api/orders/42?status=open`。
 
 `events/authorizer-request.json` 和 `events/proxy-request.json` 是同一支呼叫的精簡 event，裡面的 token 是假的。
 
@@ -140,7 +215,7 @@ Introspect 的取捨：每次 authorizer 快取未命中都會問 Okta，撤銷�
 
 JWKS 的取捨：Lambda 自己驗 JWT 簽章，不必持有 client secret，延遲比較低，Okta 輪替簽章金鑰時改抓新的 JWKS 即可。代價是撤銷通常要等 token 的 `exp`，而且只適用於 JWT，不適用 opaque token。
 
-API Gateway 的 300 秒結果快取對兩種做法都在。Introspect 只在快取未命中時才看得到撤銷。
+這份 spec 的 `authorizerResultTtlInSeconds` 是 0，所以 introspect 每次請求都會跑到。若把 TTL 調高，兩種驗證都要等 Gateway 快取過期才會再執行。
 
 ## Vault AppRole 與環境變數
 
@@ -209,20 +284,23 @@ sam deploy \
 
 `samconfig.toml.example` 是同一組參數的範本。複製成 `samconfig.toml` 再填。`samconfig.toml` 已在這個目錄的 `.gitignore`。
 
-主控台：Lambda → 該函式 → Configuration → Environment variables。名稱要和上表一致。改完之後，新的 execution environment 會看到新值；已經活著的環境要等它被換掉，或等 client secret 的 TTL 到期才會重讀 Vault。API Gateway 仍可能用舊的 authorizer 結果，直到 `ReauthorizeEvery` 到期。
+主控台：Lambda → 該函式 → Configuration → Environment variables。名稱要和上表一致。改完之後，新的 execution environment 會看到新值；已經活著的環境要等它被換掉，或等 client secret 的 TTL 到期才會重讀 Vault。目前 Gateway 的 authorizer TTL 是 0，所以下一次請求就會用到新的 authorizer 程式。改 `authorizerResultTtlInSeconds` 則要重新匯入 OpenAPI。
 
 `VaultRoleId` 與 `VaultSecretId` 在 template 設了 `NoEcho`，CloudFormation 日誌不會印出值。Lambda 環境變數本身對能讀函式設定的人仍然可見。這個範例依需求把 AppRole 放在環境變數；正式環境若要再縮小可見範圍，換掉 `VaultKvSecretCache` 的讀取方式即可，introspect 流程不用改。
 
 ## 建置與部署
 
-在這個目錄：
+在這個目錄先替換 OpenAPI 佔位符，再部署。`ROUTER_FUNCTION_NAME` 與 `LAMBDA_AUTHORIZER_NAME` 省略時使用 template 的預設函式名稱。
 
 ```bash
 mvn test
 mvn package
+AWS_REGION=us-east-1 AWS_ACCOUNT_ID=123456789012 ./scripts/render-specification.sh
 sam build
 sam deploy --guided
 ```
+
+`sam deploy` 的 `AuthorizerFunctionName`、`ProxyFunctionName` 必須和這次渲染用的名稱相同。改了其中一邊就要再跑一次 script，然後重新 `sam build`。
 
 `mvn package` 會用 shade plugin 產出：
 
@@ -241,8 +319,13 @@ Authorizer 的依賴是 `aws-lambda-java-core`、`aws-lambda-java-events`（`API
 部署完成後，stack output `ExternalApiUrl` 是 stage 的 invoke URL。在它後面接路徑，並帶 Okta access token：
 
 ```bash
-curl -sS "$EXTERNAL_API_URL/orders/42?status=open" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
+curl -sS "${EXTERNAL_API_URL}health" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Client-Id: example-client"
+
+curl -sS "${EXTERNAL_API_URL}orders/42?status=open" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Client-Id: example-client"
 ```
 
 本機測試不需要 AWS。`mvn test` 用 JDK 的 `HttpServer` 充當 Vault、Okta 與內部服務。
@@ -251,19 +334,21 @@ curl -sS "$EXTERNAL_API_URL/orders/42?status=open" \
 
 - 不要把 access token、Okta client secret、Vault `secret_id`、Vault token 寫進日誌。這個範例的 authorizer 只記 `allow`、`deny: ...` 原因，或錯誤的例外類別名稱。Proxy 只記 method、proxy path 與上游 status，不記 query、body 或 `Authorization`。
 - Template 沒有真實憑證。`VaultRoleId` 與 `VaultSecretId` 是 `NoEcho` 參數。不要提交填好的 `samconfig.toml`。
-- 兩個 Lambda 的 resource-based policy 都把 `lambda:InvokeFunction` 限制在 `apigateway.amazonaws.com`，而且 `SourceArn` 只涵蓋這一個 API。Authorizer 是 `.../{apiId}/authorizers/*`。Proxy 是 `.../{apiId}/{stage}/*/*`。SAM 轉換時還會再加一份同等範圍的 statement。兩份都不是 `Principal: "*"`。
+- 兩個 Lambda 的 resource-based policy 都把 `lambda:InvokeFunction` 限制在 `apigateway.amazonaws.com`，而且 `SourceArn` 只涵蓋這一個 API。Authorizer 是 `.../{apiId}/authorizers/*`。Proxy 是 `.../{apiId}/{stage}/*/*`。OpenAPI 沒有設 `authorizerCredentials` 或 integration `credentials`，所以 Gateway 靠這兩份 resource policy 呼叫 Lambda，而不是另一個 IAM role。Principal 不是 `"*"`。
 - Execution role 只給日誌。Authorizer 是 `AWSLambdaBasicExecutionRole`。Proxy 在沒有 VPC 時也是這個角色；有設 subnet 時改為 `AWSLambdaVPCAccessExecutionRole`（日誌加上建立 ENI 的權限）。它們不能呼叫對方，也沒有其他 AWS API 權限。
 - 不要把呼叫端的 `Authorization` 轉給內部服務。驗證已經在 authorizer 做完。內部服務若要知道是誰，讀 `X-User-Sub`。Proxy 會覆寫呼叫端傳來的 `X-User-*`。
 - 內部服務應放在私網。需要時用 `ProxySubnetIds` 與 `ProxySecurityGroupIds` 把 proxy 放進 VPC。兩個參數要一起設，或一起留空。Authorizer 仍需能走到 Okta 與 Vault；若這兩個端點也只在 VPC 裡，要另外給 authorizer 加 `VpcConfig`，這個 template 沒有幫它加。
 - Template 要求 Okta issuer 與 Vault address 使用 `https`。`UPSTREAM_BASE_URL` 允許 `http` 或 `https`，給 VPC 裡的內部服務用。Java 程式本身不強制 https，本機測試才可以指到 `http://127.0.0.1`。
-- Authorizer 結果快取會延遲撤銷生效，最長約 `ReauthorizeEvery` 秒。縮短這個值會增加 Okta 與 Vault 的呼叫次數。
-- 這個 API 沒有開 CORS。`ANY` 包含 `OPTIONS`，預檢請求也會進 authorizer。
+- `authorizerResultTtlInSeconds` 目前是 0，撤銷在下一次請求就會被 introspect 看到，每次請求也都會呼叫 authorizer 與（secret 快取未命中時）Vault。把它調高才會出現 Gateway 快取。
+- `DEFAULT_4XX` 與 `DEFAULT_5XX` 會加上 CORS 風格的 header，Origin 來自 `method.request.header.Origin`。成功回應與 `OPTIONS` 預檢不會因此放行；預檢仍走 authorizer。
 
 ## 目錄
 
 ```text
 aws-external-api/
+  specification.yaml
   template.yaml
+  scripts/render-specification.sh
   samconfig.toml.example
   pom.xml
   events/
